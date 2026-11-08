@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Coloring Book</title>
+<style>
+  :root { --bg:#2b2d33; --panel:#383b43; --fg:#eee; --accent:#ffb347; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:15px system-ui,sans-serif; overflow:hidden; overscroll-behavior:none; }
+  #app { display:flex; flex-direction:column; height:100%; }
+  #stage { flex:1; position:relative; overflow:hidden; touch-action:none; user-select:none; }
+  #paper { position:absolute; left:0; top:0; transform-origin:0 0; background:#fff;
+    box-shadow:0 4px 24px #0008; }
+  #paper canvas { position:absolute; left:0; top:0; width:100%; height:100%; }
+  #drop { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background:#000a; font-size:28px; pointer-events:none; z-index:5; }
+  body.dragging #drop { display:flex; }
+  .bar { background:var(--panel); display:flex; gap:6px; align-items:center; padding:8px;
+    flex-wrap:wrap; justify-content:center; }
+  button, label.btn { background:#4b4f59; color:var(--fg); border:0; border-radius:8px;
+    padding:10px 14px; font:inherit; cursor:pointer; min-height:44px; }
+  button:disabled { opacity:.35; }
+  .tool.on { background:var(--accent); color:#222; }
+  button:active:not(:disabled), label.btn:active { background:#5f6471; }
+  #palette { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; max-width:760px; }
+  .sw { width:38px; height:38px; border-radius:50%; border:2px solid #0006; padding:0; min-height:0; }
+  .sw.sel { outline:3px solid var(--accent); outline-offset:2px; }
+  #custom { width:44px; height:44px; padding:0; border:0; background:none; }
+  #settings { display:none; gap:18px; }
+  #settings.open { display:flex; }
+  #settings label { display:flex; flex-direction:column; font-size:12px; gap:2px; }
+  input[type=range] { width:150px; }
+  #busy { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background:#0007; z-index:6; font-size:20px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="paper"><canvas id="color"></canvas><canvas id="lines"></canvas></div>
+    <div id="drop">Drop an image here</div>
+    <div id="busy">Working…</div>
+  </div>
+  <div class="bar" id="settings">
+    <label>Detail <input type="range" id="sDetail" min="4" max="40" value="16"></label>
+    <label>Line thickness <input type="range" id="sThick" min="0" max="3" value="1"></label>
+    <label>Simplify (merge tiny areas) <input type="range" id="sMin" min="0" max="400" value="60"></label>
+  </div>
+  <div class="bar">
+    <div id="palette"></div>
+    <input type="color" id="custom" value="#ff0000" title="Custom color">
+  </div>
+  <div class="bar">
+    <button id="toolPaint" class="tool on" title="Paint (fill a region)">🖌 Paint</button>
+    <button id="toolPick" class="tool" title="Color picker (take a color from the picture)">💧 Pick</button>
+    <button id="undo" disabled>↶ Undo</button>
+    <button id="redo" disabled>↷ Redo</button>
+    <label class="btn">📂 Open image<input type="file" id="file" accept="image/*" hidden></label>
+    <button id="gear">⚙ Drawing</button>
+    <button id="fit">⤢ Fit</button>
+    <button id="save">💾 Save PNG</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const stage = $('stage'), paper = $('paper'), colorCv = $('color'), lineCv = $('lines');
+
+/* ---------- state ---------- */
+let W = 0, H = 0;
+let labels = null;          // Int32Array, region id per pixel (1..n)
+let nLabels = 0;
+let colors = null;          // Uint32Array (ABGR) per region id
+let lineAlpha = null;       // Uint8Array
+let history = [], hIdx = -1;
+const MAX_HISTORY = 60;
+let srcCanvas = null;       // original image, for re-processing with new settings
+let current = '#e63946';
+let tool = 'paint';         // 'paint' | 'pick'
+
+/* ---------- palette ---------- */
+const PALETTE = ['#e63946','#f77f00','#fcbf49','#f9e547','#a7c957','#2a9d8f','#06d6a0','#118ab2',
+  '#3a86ff','#6a4c93','#b5179e','#ff8fab','#8d5524','#c68642','#f1c27d','#ffffff',
+  '#bdbdbd','#6b6b6b','#222222','#003049','#5e8c31','#a4161a','#ffd6a5','#cdb4db'];
+const palEl = $('palette');
+function select(hex) {
+  current = hex;
+  $('custom').value = hex;
+  [...palEl.children].forEach(b => b.classList.toggle('sel', b.dataset.c === hex));
+}
+PALETTE.forEach(c => {
+  const b = document.createElement('button');
+  b.className = 'sw'; b.style.background = c; b.dataset.c = c;
+  b.onclick = () => select(c);
+  palEl.appendChild(b);
+});
+$('custom').addEventListener('input', e => select(e.target.value));
+select(PALETTE[0]);
+
+const hexToABGR = h => {
+  const n = parseInt(h.slice(1), 16);
+  return (0xff000000 | ((n & 255) << 16) | (n & 0xff00) | (n >> 16)) >>> 0;
+};
+
+/* ---------- image -> drawing ---------- */
+function boxBlur(src, w, h, r) {            // separable, running sum, edge-clamped
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h), d = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    let s = 0; const o = y * w;
+    for (let k = -r; k <= r; k++) s += src[o + Math.min(w - 1, Math.max(0, k))];
+    for (let x = 0; x < w; x++) {
+      tmp[o + x] = s / d;
+      s += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let k = -r; k <= r; k++) s += tmp[Math.min(h - 1, Math.max(0, k)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / d;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+function dilate(mask, w, h) {               // 3x3 cross
+  const out = new Uint8Array(mask);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (mask[i]) continue;
+    if ((x > 0 && mask[i - 1]) || (x < w - 1 && mask[i + 1]) ||
+        (y > 0 && mask[i - w]) || (y < h - 1 && mask[i + w])) out[i] = 1;
+  }
+  return out;
+}
+
+function process(canvas) {
+  const MAX = 1400;
+  const sc = Math.min(1, MAX / Math.max(canvas.width, canvas.height));
+  W = Math.round(canvas.width * sc); H = Math.round(canvas.height * sc);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, W, H);
+  cx.drawImage(canvas, 0, 0, W, H);
+  const px = cx.getImageData(0, 0, W, H).data;
+  const N = W * H, gray = new Float32Array(N);
+  for (let i = 0; i < N; i++) gray[i] = 0.299 * px[i*4] + 0.587 * px[i*4+1] + 0.114 * px[i*4+2];
+
+  const T = +$('sDetail').value, thick = +$('sThick').value, minA = +$('sMin').value;
+  const r = Math.max(2, Math.round(Math.max(W, H) / 220));
+  let blur = boxBlur(gray, W, H, r); blur = boxBlur(blur, W, H, r);
+  let mask = new Uint8Array(N);
+  for (let i = 0; i < N; i++) mask[i] = (gray[i] < blur[i] - T * 0.6 && gray[i] < 235) ? 1 : 0;
+  for (let k = 0; k < thick; k++) mask = dilate(mask, W, H);
+
+  // label connected non-line regions (4-connected)
+  labels = new Int32Array(N);
+  const areas = [0];
+  const stack = new Int32Array(N);
+  let n = 0;
+  for (let s = 0; s < N; s++) {
+    if (mask[s] || labels[s]) continue;
+    n++; let sp = 0, area = 0;
+    stack[sp++] = s; labels[s] = n;
+    while (sp) {
+      const i = stack[--sp]; area++;
+      const x = i % W;
+      if (x > 0 && !mask[i-1] && !labels[i-1]) { labels[i-1] = n; stack[sp++] = i-1; }
+      if (x < W-1 && !mask[i+1] && !labels[i+1]) { labels[i+1] = n; stack[sp++] = i+1; }
+      if (i >= W && !mask[i-W] && !labels[i-W]) { labels[i-W] = n; stack[sp++] = i-W; }
+      if (i < N-W && !mask[i+W] && !labels[i+W]) { labels[i+W] = n; stack[sp++] = i+W; }
+    }
+    areas.push(area);
+  }
+  // drop tiny regions (they get absorbed by neighbours below), renumber the rest
+  const remap = new Int32Array(n + 1); let m = 0;
+  for (let l = 1; l <= n; l++) if (areas[l] >= minA) remap[l] = ++m;
+  if (m === 0) { remap[1] = m = 1; }       // degenerate: keep at least one region
+  for (let i = 0; i < N; i++) labels[i] = remap[labels[i]];
+  nLabels = m;
+
+  // multi-source BFS: line pixels & dropped regions take the label of the nearest region
+  const queue = new Int32Array(N); let qh = 0, qt = 0;
+  for (let i = 0; i < N; i++) if (labels[i]) queue[qt++] = i;
+  while (qh < qt) {
+    const i = queue[qh++], l = labels[i], x = i % W;
+    if (x > 0 && !labels[i-1]) { labels[i-1] = l; queue[qt++] = i-1; }
+    if (x < W-1 && !labels[i+1]) { labels[i+1] = l; queue[qt++] = i+1; }
+    if (i >= W && !labels[i-W]) { labels[i-W] = l; queue[qt++] = i-W; }
+    if (i < N-W && !labels[i+W]) { labels[i+W] = l; queue[qt++] = i+W; }
+  }
+
+  // anti-aliased line overlay (3x3 average of the mask)
+  lineAlpha = new Uint8Array(N);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let s = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const yy = Math.min(H-1, Math.max(0, y+dy)) * W;
+      for (let dx = -1; dx <= 1; dx++) s += mask[yy + Math.min(W-1, Math.max(0, x+dx))];
+    }
+    lineAlpha[y*W + x] = Math.min(255, s * 28 + (mask[y*W+x] ? 40 : 0));
+  }
+
+  colorCv.width = lineCv.width = W; colorCv.height = lineCv.height = H;
+  paper.style.width = W + 'px'; paper.style.height = H + 'px';
+  const lctx = lineCv.getContext('2d'), li = lctx.createImageData(W, H), l32 = new Uint32Array(li.data.buffer);
+  for (let i = 0; i < N; i++) l32[i] = (lineAlpha[i] << 24) | 0x00222222;
+  lctx.putImageData(li, 0, 0);
+
+  colors = new Uint32Array(nLabels + 1).fill(0xffffffff);
+  history = [new Uint32Array(colors)]; hIdx = 0;
+  render(); updateButtons(); fitView();
+}
+
+/* ---------- rendering & fill ---------- */
+let colorImg = null, color32 = null;
+function render() {
+  const ctx = colorCv.getContext('2d');
+  if (!colorImg || colorImg.width !== W || colorImg.height !== H) {
+    colorImg = ctx.createImageData(W, H); color32 = new Uint32Array(colorImg.data.buffer);
+  }
+  for (let i = 0, N = W * H; i < N; i++) color32[i] = colors[labels[i]];
+  ctx.putImageData(colorImg, 0, 0);
+}
+
+function setTool(t) {
+  tool = t;
+  $('toolPaint').classList.toggle('on', t === 'paint');
+  $('toolPick').classList.toggle('on', t === 'pick');
+}
+$('toolPaint').onclick = () => setTool('paint');
+$('toolPick').onclick = () => setTool('pick');
+
+const abgrToHex = v => '#' + [v & 255, (v >> 8) & 255, (v >> 16) & 255]
+  .map(n => n.toString(16).padStart(2, '0')).join('');
+
+function fillAt(px, py) {
+  if (!labels) return;
+  const x = Math.floor(px), y = Math.floor(py);
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const l = labels[y * W + x];
+  if (tool === 'pick') { select(abgrToHex(colors[l])); setTool('paint'); return; }
+  const c = hexToABGR(current);
+  if (colors[l] === c) return;
+  colors[l] = c;
+  history.length = hIdx + 1;
+  history.push(new Uint32Array(colors));
+  if (history.length > MAX_HISTORY) history.shift();
+  hIdx = history.length - 1;
+  render(); updateButtons();
+}
+
+function restore(i) {
+  hIdx = i; colors.set(history[hIdx]); render(); updateButtons();
+}
+$('undo').onclick = () => hIdx > 0 && restore(hIdx - 1);
+$('redo').onclick = () => hIdx < history.length - 1 && restore(hIdx + 1);
+function updateButtons() {
+  $('undo').disabled = hIdx <= 0;
+  $('redo').disabled = hIdx >= history.length - 1;
+}
+addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); (e.shiftKey ? $('redo') : $('undo')).click(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); $('redo').click(); }
+});
+
+/* ---------- pan / zoom / tap ---------- */
+let view = { s: 1, x: 0, y: 0 };
+function applyView() { paper.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.s})`; }
+function fitView() {
+  const r = stage.getBoundingClientRect(), pad = 16;
+  view.s = Math.min((r.width - pad*2) / W, (r.height - pad*2) / H);
+  view.x = (r.width - W * view.s) / 2; view.y = (r.height - H * view.s) / 2;
+  applyView();
+}
+function zoomAt(cx, cy, factor) {
+  const ns = Math.min(12, Math.max(0.2, view.s * factor)), k = ns / view.s;
+  view.x = cx - (cx - view.x) * k; view.y = cy - (cy - view.y) * k; view.s = ns; applyView();
+}
+$('fit').onclick = fitView;
+addEventListener('resize', () => labels && fitView());
+stage.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = stage.getBoundingClientRect();
+  zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+const ptrs = new Map(); let tapCandidate = null, last2 = null;
+stage.addEventListener('pointerdown', e => {
+  stage.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  tapCandidate = ptrs.size === 1 ? { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() } : null;
+  last2 = null;
+});
+stage.addEventListener('pointermove', e => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  const r = stage.getBoundingClientRect();
+  if (ptrs.size === 1) {
+    if (tapCandidate && Math.hypot(e.clientX - tapCandidate.x, e.clientY - tapCandidate.y) > 8) tapCandidate = null;
+    if (!tapCandidate) { view.x += e.clientX - p.x; view.y += e.clientY - p.y; applyView(); }
+  } else if (ptrs.size === 2) {
+    tapCandidate = null;
+    p.x = e.clientX; p.y = e.clientY;
+    const [a, b] = [...ptrs.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    if (last2) {
+      view.x += mx - last2.mx; view.y += my - last2.my;
+      zoomAt(mx - r.left, my - r.top, d / last2.d);
+    }
+    last2 = { d, mx, my };
+  }
+  p.x = e.clientX; p.y = e.clientY;
+});
+function endPtr(e) {
+  if (tapCandidate && tapCandidate.id === e.pointerId && e.type === 'pointerup') {
+    const r = paper.getBoundingClientRect();
+    fillAt((e.clientX - r.left) / view.s, (e.clientY - r.top) / view.s);
+  }
+  ptrs.delete(e.pointerId); tapCandidate = null; last2 = null;
+}
+stage.addEventListener('pointerup', endPtr);
+stage.addEventListener('pointercancel', endPtr);
+
+/* ---------- loading images ---------- */
+function showBusy(on) { $('busy').style.display = on ? 'flex' : 'none'; }
+function loadSource(canvas) {
+  srcCanvas = canvas; showBusy(true);
+  setTimeout(() => { try { process(canvas); } finally { showBusy(false); } }, 30);
+}
+function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const url = URL.createObjectURL(file), img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0); URL.revokeObjectURL(url); loadSource(c);
+  };
+  img.src = url;
+}
+$('file').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  loadFile(e.dataTransfer.files[0]);
+});
+addEventListener('paste', e => {
+  const f = [...(e.clipboardData?.files || [])].find(f => f.type.startsWith('image/')); if (f) loadFile(f);
+});
+
+/* settings */
+$('gear').onclick = () => { $('settings').classList.toggle('open'); setTimeout(() => labels && fitView(), 0); };
+['sDetail','sThick','sMin'].forEach(id => $(id).addEventListener('change', () => srcCanvas && loadSource(srcCanvas)));
+
+/* save */
+$('save').onclick = () => {
+  if (!labels) return;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d'); x.drawImage(colorCv, 0, 0); x.drawImage(lineCv, 0, 0);
+  c.toBlob(b => {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b);
+    a.download = 'coloring.png'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  });
+};
+
+/* ---------- built-in sample so it works right away ---------- */
+function sample() {
+  const c = document.createElement('canvas'); c.width = 1000; c.height = 750;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, 1000, 750);
+  x.strokeStyle = '#000'; x.lineWidth = 5; x.lineJoin = 'round';
+  // sun
+  x.beginPath(); x.arc(860, 110, 60, 0, 7); x.stroke();
+  for (let i = 0; i < 12; i++) { const a = i * Math.PI / 6;
+    x.beginPath(); x.moveTo(860 + Math.cos(a) * 75, 110 + Math.sin(a) * 75);
+    x.lineTo(860 + Math.cos(a) * 105, 110 + Math.sin(a) * 105); x.stroke(); }
+  // hills
+  x.beginPath(); x.moveTo(0, 600); x.quadraticCurveTo(250, 450, 520, 580); x.quadraticCurveTo(780, 480, 1000, 580);
+  x.lineTo(1000, 750); x.lineTo(0, 750); x.closePath(); x.stroke();
+  // flower
+  const fx = 400, fy = 280;
+  x.beginPath(); x.moveTo(fx, fy + 70); x.quadraticCurveTo(fx - 30, fy + 250, fx, 640); x.stroke();
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4;
+    x.beginPath(); x.ellipse(fx + Math.cos(a) * 85, fy + Math.sin(a) * 85, 55, 30, a, 0, 7); x.stroke(); }
+  x.beginPath(); x.arc(fx, fy, 48, 0, 7); x.stroke();
+  // leaf
+  x.beginPath(); x.moveTo(fx - 8, 500); x.quadraticCurveTo(fx - 140, 440, fx - 160, 520);
+  x.quadraticCurveTo(fx - 70, 560, fx - 8, 500); x.stroke();
+  // cloud
+  x.beginPath(); x.arc(150, 130, 45, Math.PI, 0); x.arc(230, 120, 55, Math.PI, 0); x.arc(310, 135, 40, Math.PI, 0);
+  x.lineTo(110, 175); x.arc(110, 150, 25, Math.PI / 2, Math.PI * 1.5); x.closePath(); x.stroke();
+  return c;
+}
+loadSource(sample());
+</script>
+</body>
+</html>
